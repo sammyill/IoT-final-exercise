@@ -26,7 +26,34 @@ volumes:
 
 services:
 
-
+  # ── Traefik (reverse proxy: routing per nome host) ─────────
+  # Tutti i web UI sono raggiungibili via http://<nome>.localhost
+  # invece di memorizzare le porte. Su Windows *.localhost
+  # risolve automaticamente a 127.0.0.1.
+  traefik:
+    image: traefik:v3.1
+    container_name: traefik
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true"          # dashboard senza auth (solo lab)
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+    ports:
+      - "80:80"        # entrypoint HTTP per tutti i servizi web
+      - "8080:8080"    # dashboard Traefik → http://traefik.localhost:8080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - wan_simulated_net
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.localhost`)"
+      - "traefik.http.routers.traefik.entrypoints=web"
+      - "traefik.http.routers.traefik.service=api@internal"
 
   # ── Factory Sensors ────────────────────────────────────
   # ── Using CoAP ────────────────────────────────────
@@ -210,14 +237,17 @@ services:
   # ── Node-RED (dashboard + alerting) ────────────────────────
   nodered:
     build: ./nodered
-    container_name: node-red-coap
+    container_name: nodered
     networks:
       - wan_simulated_net
-    ports:
-      - "1880:1880"
     volumes:
       - ./nodered/data:/data  # flussi e configurazioni persistenti
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.nodered.rule=Host(`nodered.localhost`)"
+      - "traefik.http.routers.nodered.entrypoints=web"
+      - "traefik.http.services.nodered.loadbalancer.server.port=1880"
 
   # ── InfluxDB v2 (time-series database) ─────────────────────
   influxdb:
@@ -225,10 +255,13 @@ services:
     container_name: influxdb
     networks:
       - wan_simulated_net
-    ports:
-      - "8086:8086"
     volumes:
       - influxdb_data:/var/lib/influxdb2
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.influxdb.rule=Host(`influxdb.localhost`)"
+      - "traefik.http.routers.influxdb.entrypoints=web"
+      - "traefik.http.services.influxdb.loadbalancer.server.port=8086"
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USER}
@@ -245,15 +278,20 @@ services:
     restart: unless-stopped
 
   # ── Mailhog (fake SMTP per test email) ─────────────────────
+  # SMTP rimane raggiungibile internamente come mailhog:1025
+  # (lo userà l'amqp-gateway per inviare email). La UI passa
+  # da Traefik → http://mailhog.localhost
   mailhog:
     image: mailhog/mailhog:v1.0.1
-    container_name: mailhog-coap
+    container_name: mailhog
     networks:
       - wan_simulated_net
-    ports:
-      - "4025:1025"   # SMTP
-      - "5025:8025"   # Web UI → http://localhost:5025
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.mailhog.rule=Host(`mailhog.localhost`)"
+      - "traefik.http.routers.mailhog.entrypoints=web"
+      - "traefik.http.services.mailhog.loadbalancer.server.port=8025"
 
   # ── Chaos (simulatore di guasti di rete) ───────────────────
   chaos:
