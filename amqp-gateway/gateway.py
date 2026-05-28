@@ -1,236 +1,247 @@
-#!/usr/bin/env python3
 """
-AMQP Gateway — Consumer RabbitMQ → InfluxDB
+amqp-gateway — HTTP receiver + alert emailer
+============================================
+Riceve dati di temperatura via HTTP POST da due fonti distinte
+e invia email a Mailhog quando la temperatura supera la soglia.
 
-Consuma la queue 'iot.temperature', accumula messaggi in batch,
-poi scrive su InfluxDB in un'unica chiamata HTTP (batch write).
-
-Garanzie:
-- Manual ACK: il messaggio viene rimosso dalla queue SOLO dopo la scrittura.
-  Se il gateway crasha, RabbitMQ ri-consegna i messaggi (at-least-once).
-- Multiple ACK: basic_ack(multiple=True) acknowledges l'intero batch con
-  un solo frame AMQP → riduce il traffico del 95%.
-- NACK + requeue: se InfluxDB è down, i messaggi restano nella queue.
-- JSON malformato → NACK senza requeue → va in DLQ (iot.temperature.dlq).
-- Prefetch: RabbitMQ non invia più di PREFETCH_COUNT messaggi non-acked
-  per volta → backpressure naturale.
+Endpoints:
+  POST /fridge    ← chiamato da Telegraf (sensori MQTT)
+  POST /factory   ← chiamato da factory-gateway (sensori CoAP)
+  GET  /health    ← stato e statistiche
 
 Architettura:
+  HTTP request → asyncio.Queue per-source (fridge | factory)
+                    │
+                    ▼
+              consumer task → threshold check → SMTP to Mailhog
 
-  RabbitMQ 'iot.temperature'
-       │ CONSUME (prefetch=50)
-       ▼
-  on_message() → pending[]
-       │
-       ├─ len >= BATCH_SIZE? → flush()
-       │
-  process_data_events(2s)
-       │
-       └─ timer scaduto + pending? → flush()
-
-  flush():
-    write_api.write(points) → InfluxDB
-    OK  → basic_ack(last, multiple=True)
-    ERR → basic_nack(last, multiple=True, requeue=True)
+Cooldown: dopo un'email per sensor_id X, sopprime ulteriori email
+sullo stesso sensore per COOLDOWN_SECS (default 300s = 5 min).
+Questo evita di inondare la inbox quando un sensore resta "caldo".
 """
 
+import asyncio
 import os
-import json
+import smtplib
 import time
-import signal
+from email.mime.text import MIMEText
 
-import pika
-from pika.exceptions import AMQPConnectionError, AMQPChannelError
-from influxdb_client import InfluxDBClient
-from influxdb_client.client.write_api import SYNCHRONOUS
-from influxdb_client.client.write.point import Point
+from aiohttp import web
 
-# ── Configurazione ─────────────────────────────────────────────────────────────
-RABBITMQ_HOST   = os.getenv("RABBITMQ_HOST",   "rabbitmq")
-RABBITMQ_PORT   = int(os.getenv("RABBITMQ_PORT",  "5672"))
-RABBITMQ_USER   = os.getenv("RABBITMQ_USER",   "iot")
-RABBITMQ_PASS   = os.getenv("RABBITMQ_PASS",   "iot-password")
-QUEUE_NAME      = os.getenv("QUEUE_NAME",      "iot.temperature")
-EXCHANGE_NAME   = os.getenv("EXCHANGE_NAME",   "iot.sensors")
+# ── Config (da variabili d'ambiente) ────────────────────────────
+HTTP_PORT       = int(os.getenv("HTTP_PORT",      "8000"))
+TEMP_THRESHOLD  = float(os.getenv("TEMP_THRESHOLD", "30.0"))
+SMTP_HOST       = os.getenv("SMTP_HOST",          "mailhog")
+SMTP_PORT       = int(os.getenv("SMTP_PORT",      "1025"))
+ALERT_FROM      = os.getenv("ALERT_FROM",         "iot-gateway@example.com")
+ALERT_TO        = os.getenv("ALERT_TO",           "ops@example.com")
+COOLDOWN_SECS   = int(os.getenv("COOLDOWN_SECS",  "300"))
+QUEUE_MAX       = int(os.getenv("QUEUE_MAX",      "1000"))
 
-INFLUX_URL      = os.getenv("INFLUX_URL",      "http://influxdb:8086")
-INFLUX_TOKEN    = os.getenv("INFLUX_TOKEN",    "my-super-token")
-INFLUX_ORG      = os.getenv("INFLUX_ORG",      "its")
-INFLUX_BUCKET   = os.getenv("INFLUX_BUCKET",   "iot")
-
-PREFETCH_COUNT  = int(os.getenv("PREFETCH_COUNT", "50"))
-BATCH_SIZE      = int(os.getenv("BATCH_SIZE",     "20"))
-BATCH_TIMEOUT   = float(os.getenv("BATCH_TIMEOUT", "2.0"))
-
-# ── Stato globale ──────────────────────────────────────────────────────────────
-pending    = []
-last_flush = time.time()
-write_api  = None
-running    = True
-stats      = {"received": 0, "written": 0, "errors": 0, "nacked": 0}
+# Stato globale
+fridge_queue:  asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX)
+factory_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX)
+last_alert: dict = {}  # sensor_id → epoch dell'ultima email inviata
+stats = {
+    "rx_fridge":   0,
+    "rx_factory":  0,
+    "emails_sent": 0,
+    "suppressed":  0,
+    "errors":      0,
+}
 
 
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ── InfluxDB ───────────────────────────────────────────────────────────────────
+# ── Normalizzazione payload ────────────────────────────────────
+# Telegraf invia in batch:
+#   {"metrics":[{"name":"...","fields":{"value":25.4,"seq":1},
+#                "tags":{"sensor_id":"sensor01","topic":"fridge"},
+#                "timestamp":1700000000}]}
+# Il factory-gateway invia il payload nativo del sensore:
+#   {"sensor_id":"factory01","temperatura":25.4,"ts":...,"seq":1}
+# Questa funzione restituisce sempre una lista di record normalizzati.
 
-def init_influxdb() -> None:
-    global write_api
-    log(f"[INFLUX] Attendo InfluxDB su {INFLUX_URL}...")
-    while True:
-        try:
-            client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
-            if client.health().status == "pass":
-                write_api = client.write_api(write_options=SYNCHRONOUS)
-                log("[INFLUX] ✓ InfluxDB pronto!")
-                return
-        except Exception as e:
-            log(f"[INFLUX] Non raggiungibile: {e}. Riprovo tra 5s...")
-        time.sleep(5)
-
-
-def build_point(data: dict) -> Point:
-    p = (
-        Point("temperatura")
-        .tag("sensor_id", data.get("sensor_id", "unknown"))
-        .field("value",   float(data["temperatura"]))
-        .field("seq",     int(data.get("seq", 0)))
-    )
-    if "timestamp" in data:
-        p = p.time(int(data["timestamp"] * 1_000_000_000))
-    return p
-
-
-def flush(ch) -> None:
-    global pending, last_flush
-    last_flush = time.time()
-    if not pending:
-        return
-
-    batch   = pending[:]
-    pending = []
-    last_dt = batch[-1][0]
-    points  = [build_point(d) for _, d in batch]
-
+def _from_telegraf_metric(m: dict):
+    fields = m.get("fields", {}) or {}
+    tags   = m.get("tags",   {}) or {}
+    sensor_id = tags.get("sensor_id") or fields.get("sensor_id")
+    # Telegraf usa "value" come field nominale; fallback su "temperatura"
+    temp = fields.get("value", fields.get("temperatura"))
+    if sensor_id is None or temp is None:
+        return None
     try:
-        write_api.write(bucket=INFLUX_BUCKET, record=points)
-        ch.basic_ack(delivery_tag=last_dt, multiple=True)
-        stats["written"] += len(batch)
-        log(f"[INFLUX] ✓ Scritti {len(batch)} punti in batch | "
-            f"totale={stats['written']} | buf={len(pending)}")
+        return {"sensor_id": str(sensor_id), "temperatura": float(temp)}
+    except (TypeError, ValueError):
+        return None
+
+
+def _from_native(d: dict):
+    sensor_id = d.get("sensor_id")
+    temp = d.get("temperatura")
+    if sensor_id is None or temp is None:
+        return None
+    try:
+        return {"sensor_id": str(sensor_id), "temperatura": float(temp)}
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize(payload) -> list:
+    if isinstance(payload, dict) and "metrics" in payload:
+        return [r for r in (_from_telegraf_metric(m) for m in payload["metrics"]) if r]
+    if isinstance(payload, list):
+        return [r for r in (_from_native(d) for d in payload if isinstance(d, dict)) if r]
+    if isinstance(payload, dict):
+        single = _from_native(payload)
+        return [single] if single else []
+    return []
+
+
+# ── SMTP (sincrono, eseguito in thread executor) ───────────────
+def send_email(source: str, sensor_id: str, temp: float) -> bool:
+    body = (
+        f"ALERT: temperatura fuori soglia\n"
+        f"Sorgente   : {source}\n"
+        f"Sensor ID  : {sensor_id}\n"
+        f"Temperatura: {temp:.2f}°C (soglia {TEMP_THRESHOLD}°C)\n"
+        f"Timestamp  : {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+    msg = MIMEText(body)
+    msg["Subject"] = f"[IoT-Alert] {source}/{sensor_id} = {temp:.1f}°C"
+    msg["From"] = ALERT_FROM
+    msg["To"]   = ALERT_TO
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+            s.send_message(msg)
+        return True
     except Exception as e:
-        stats["errors"] += 1
-        try:
-            ch.basic_nack(delivery_tag=last_dt, multiple=True, requeue=True)
-        except Exception:
-            pass
-        stats["nacked"] += len(batch)
-        pending = batch + pending
-        log(f"[ERR] Batch write fallito (#{stats['errors']}): {e}")
-        log(f"[ERR] {len(batch)} msg rimandati in queue (nack+requeue)")
-        time.sleep(2)
+        log(f"[SMTP] ✗ Invio fallito: {e}")
+        return False
 
 
-# ── Consumer ───────────────────────────────────────────────────────────────────
-
-def on_message(ch, method, properties, body) -> None:
-    global pending
-    try:
-        data = json.loads(body.decode("utf-8"))
-    except json.JSONDecodeError as e:
-        log(f"[ERR] JSON malformato: {e} | body={body[:60]!r}")
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        return
-
-    pending.append((method.delivery_tag, data))
-    stats["received"] += 1
-
-    if stats["received"] % 20 == 0:
-        log(f"[RX] ricevuti={stats['received']} | scritti={stats['written']} | "
-            f"buf={len(pending)} | nacked={stats['nacked']} | "
-            f"ultimo: {data.get('sensor_id')} → {data.get('temperatura')}°C")
-
-    if len(pending) >= BATCH_SIZE:
-        flush(ch)
-
-
-def init_rabbitmq():
-    credentials = pika.PlainCredentials(RABBITMQ_USER, RABBITMQ_PASS)
-    params = pika.ConnectionParameters(
-        host=RABBITMQ_HOST,
-        port=RABBITMQ_PORT,
-        virtual_host="/",
-        credentials=credentials,
-        heartbeat=60,
-        blocked_connection_timeout=300,
-    )
+# ── Consumer asincrono per ciascuna queue ──────────────────────
+async def consumer(name: str, queue: asyncio.Queue):
+    log(f"[CONSUMER] {name} avviato "
+        f"(threshold={TEMP_THRESHOLD}°C, cooldown={COOLDOWN_SECS}s)")
+    loop = asyncio.get_event_loop()
     while True:
+        record = await queue.get()
         try:
-            log(f"[AMQP] Connessione a {RABBITMQ_HOST}:{RABBITMQ_PORT}...")
-            conn = pika.BlockingConnection(params)
-            ch   = conn.channel()
-            ch.basic_qos(prefetch_count=PREFETCH_COUNT)
-            ch.exchange_declare(exchange=EXCHANGE_NAME, exchange_type="topic", durable=True)
-            ch.queue_declare(
-                queue=QUEUE_NAME, durable=True,
-                arguments={
-                    "x-message-ttl": 3_600_000,
-                    "x-max-length": 10_000,
-                    "x-dead-letter-exchange": "iot.dlx",
-                    "x-dead-letter-routing-key": "temperatura",
-                },
-            )
-            ch.queue_bind(queue=QUEUE_NAME, exchange=EXCHANGE_NAME,
-                          routing_key="sensor.#.temperatura")
-            ch.basic_consume(queue=QUEUE_NAME, on_message_callback=on_message, auto_ack=False)
-            log(f"[AMQP] ✓ Connesso! Consumer attivo su queue='{QUEUE_NAME}'")
-            log(f"[AMQP]   prefetch={PREFETCH_COUNT} | batch={BATCH_SIZE} msg o {BATCH_TIMEOUT}s")
-            return conn, ch
+            sensor_id = record["sensor_id"]
+            temp      = record["temperatura"]
+
+            if temp <= TEMP_THRESHOLD:
+                continue
+
+            now  = time.time()
+            last = last_alert.get(sensor_id, 0.0)
+            if now - last < COOLDOWN_SECS:
+                stats["suppressed"] += 1
+                remaining = int(COOLDOWN_SECS - (now - last))
+                log(f"[ALERT] {name}/{sensor_id}={temp:.2f}°C — "
+                    f"SOPPRESSA (cooldown {remaining}s)")
+                continue
+
+            # smtplib è bloccante: spostiamolo in un thread per non
+            # fermare l'event loop di aiohttp.
+            ok = await loop.run_in_executor(None, send_email, name, sensor_id, temp)
+            if ok:
+                last_alert[sensor_id] = now
+                stats["emails_sent"] += 1
+                log(f"[ALERT] ✉ {name}/{sensor_id}={temp:.2f}°C — "
+                    f"email inviata (tot={stats['emails_sent']})")
+            else:
+                stats["errors"] += 1
         except Exception as e:
-            log(f"[AMQP] Connessione fallita: {e}. Riprovo tra 5s...")
-            time.sleep(5)
+            stats["errors"] += 1
+            log(f"[CONSUMER] {name} errore: {e}")
+        finally:
+            queue.task_done()
 
 
-def main() -> None:
-    global running
+# ── Handler HTTP ───────────────────────────────────────────────
+async def _ingest(request, source: str, queue: asyncio.Queue, stat_key: str):
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
 
-    log("[BOOT] AMQP Gateway avviato")
-    log(f"[BOOT]   RABBITMQ  = {RABBITMQ_HOST}:{RABBITMQ_PORT}")
-    log(f"[BOOT]   QUEUE     = {QUEUE_NAME}")
-    log(f"[BOOT]   INFLUX    = {INFLUX_URL}")
-    log(f"[BOOT]   PREFETCH  = {PREFETCH_COUNT}")
-    log(f"[BOOT]   BATCH     = {BATCH_SIZE} msg / {BATCH_TIMEOUT}s")
-
-    def shutdown(sig, frame):
-        global running
-        log("[BOOT] Shutdown...")
-        running = False
-
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
-
-    init_influxdb()
-    connection, channel = init_rabbitmq()
-
-    while running:
+    records = normalize(payload)
+    accepted = 0
+    for r in records:
+        stats[stat_key] += 1
         try:
-            connection.process_data_events(time_limit=BATCH_TIMEOUT)
-            if pending and (time.time() - last_flush >= BATCH_TIMEOUT):
-                flush(channel)
-        except (AMQPConnectionError, AMQPChannelError, Exception) as e:
-            log(f"[AMQP] Connessione persa: {e}. Riconnessione...")
-            try:
-                connection.close()
-            except Exception:
-                pass
-            pending.clear()
-            time.sleep(3)
-            connection, channel = init_rabbitmq()
+            queue.put_nowait(r)
+            accepted += 1
+        except asyncio.QueueFull:
+            stats["errors"] += 1
+            log(f"[{source}] Queue piena, scarto {r['sensor_id']}={r['temperatura']}")
 
-    log("[BOOT] Gateway fermato.")
+    # Log periodico, non a ogni request
+    if stats[stat_key] % 20 == 1:
+        log(f"[RX] {source}: rx_tot={stats[stat_key]} | "
+            f"emails={stats['emails_sent']} | suppressed={stats['suppressed']}")
+
+    return web.json_response({"received": accepted})
+
+
+async def handle_fridge(request):
+    return await _ingest(request, "fridge", fridge_queue, "rx_fridge")
+
+
+async def handle_factory(request):
+    return await _ingest(request, "factory", factory_queue, "rx_factory")
+
+
+async def handle_health(request):
+    return web.json_response({
+        "status": "ok",
+        "threshold": TEMP_THRESHOLD,
+        "cooldown_secs": COOLDOWN_SECS,
+        "queues": {
+            "fridge":  fridge_queue.qsize(),
+            "factory": factory_queue.qsize(),
+        },
+        "stats": stats,
+    })
+
+
+# ── Main ───────────────────────────────────────────────────────
+async def main():
+    log("=" * 60)
+    log("[BOOT] amqp-gateway (HTTP receiver + alert emailer)")
+    log(f"[BOOT]   HTTP_PORT      = {HTTP_PORT}")
+    log(f"[BOOT]   TEMP_THRESHOLD = {TEMP_THRESHOLD}°C")
+    log(f"[BOOT]   SMTP           = {SMTP_HOST}:{SMTP_PORT}")
+    log(f"[BOOT]   FROM → TO      = {ALERT_FROM} → {ALERT_TO}")
+    log(f"[BOOT]   COOLDOWN       = {COOLDOWN_SECS}s per sensore")
+    log(f"[BOOT]   QUEUE_MAX      = {QUEUE_MAX}")
+    log("=" * 60)
+
+    app = web.Application()
+    app.router.add_post("/fridge",  handle_fridge)
+    app.router.add_post("/factory", handle_factory)
+    app.router.add_get ("/health",  handle_health)
+
+    asyncio.create_task(consumer("fridge",  fridge_queue))
+    asyncio.create_task(consumer("factory", factory_queue))
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
+    await site.start()
+    log(f"[BOOT] HTTP server in ascolto su 0.0.0.0:{HTTP_PORT}")
+    log("[BOOT] Endpoints: POST /fridge, POST /factory, GET /health")
+
+    # Loop infinito
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log(f"[BOOT] Stop. Stats finali: {stats}")

@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ─── Template sensore ──────────────────────────────────────────────────────────
 x-sensor-factory: &sensor-factory
   build: ./factory_coap
@@ -14,11 +12,16 @@ x-sensor-fridge: &sensor-fridge
   restart: unless-stopped
 
 networks:
+  # Nomi espliciti: il container chaos li usa via docker CLI
+  # e non vuole conoscere il prefisso del progetto.
   wan_simulated_net:
+    name: wan_simulated_net
     driver: bridge
   factory_net:
+    name: factory_net
     driver: bridge
   fridge_net:
+    name: fridge_net
     driver: bridge
 
 volumes:
@@ -103,7 +106,7 @@ services:
     <<: *sensor-factory
     container_name: factory08
     environment:
-      SENSOR_ID: factory-08
+      SENSOR_ID: factory08
 
   sensor-factory-09:
     <<: *sensor-factory
@@ -198,7 +201,8 @@ services:
       INFLUX_ORG: ${INFLUX_ORG}
       INFLUX_BUCKET: ${INFLUX_BUCKET}
       COAP_PORT: 5683
-  
+      AMQP_GATEWAY_URL: http://amqp-gateway:8000/factory
+
   # ── Mosquitto mqtt broker ────────────────────────────────────────────
   mosquitto:
     image: eclipse-mosquitto:latest
@@ -206,9 +210,9 @@ services:
     ports:
       - "1883:1883"         # MQTT standard
     volumes:
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - ./mosquitto/data:/mosquitto/data   # persistenza messaggi su disco
-      - ./mosquitto/log:/mosquitto/log
+      - ./mosquitto-broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto-broker/data:/mosquitto/data   # persistenza messaggi su disco
+      - ./mosquitto-broker/log:/mosquitto/log
     networks:
       - fridge_net          # lato sensori
       - wan_simulated_net            # lato servizi
@@ -293,38 +297,39 @@ services:
       - "traefik.http.routers.mailhog.entrypoints=web"
       - "traefik.http.services.mailhog.loadbalancer.server.port=8025"
 
-  # ── Chaos (simulatore di guasti di rete) ───────────────────
+  # ── Chaos (ferma e riavvia container per testare la resilienza) ──
+  # Usa `docker stop` / `docker start`: niente magia di network,
+  # i container ripartono dallo stato cleanly.
   chaos:
     build: ./chaos
-    container_name: network-chaos-coap
+    container_name: chaos
     networks:
-      - factory_net
       - wan_simulated_net
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      FACTORY_NET: factory_net
-      CORE_NET: wan_simulated_net
-      DROP_INTERVAL: ${CHAOS_DROP_INTERVAL:-90}
-      DROP_DURATION: ${CHAOS_DROP_DURATION:-20}
+      DROP_INTERVAL: ${CHAOS_DROP_INTERVAL:-180}
+      DROP_DURATION: ${CHAOS_DROP_DURATION:-10}
       CHAOS_ENABLED: ${CHAOS_ENABLED:-true}
     restart: unless-stopped
 
-  # ── Gateway AMQP → InfluxDB ──────────────────────────────────────────────────
+  # ── amqp-gateway: ricevitore HTTP + invio email a Mailhog ────────────────
+  # Espone POST /fridge e POST /factory; controlla soglia e invia
+  # email a Mailhog quando temperatura > TEMP_THRESHOLD.
+  # NB: non parla AMQP/RabbitMQ — il nome è storico.
   amqp-gateway:
     build: ./amqp-gateway
     container_name: amqp-gateway
     networks:
       - wan_simulated_net
+    depends_on:
+      - mailhog
     environment:
-     
-      QUEUE_NAME: ${QUEUE_NAME:-iot.temperature}
-      EXCHANGE_NAME: ${EXCHANGE_NAME:-iot.sensors}
-      INFLUX_URL: http://influxdb:8086
-      INFLUX_TOKEN: ${INFLUX_TOKEN:-my-super-token}
-      INFLUX_ORG: ${INFLUX_ORG:-its}
-      INFLUX_BUCKET: ${INFLUX_BUCKET:-iot}
-      PREFETCH_COUNT: ${PREFETCH_COUNT:-50}
-      BATCH_SIZE: ${BATCH_SIZE:-20}
-      BATCH_TIMEOUT: ${BATCH_TIMEOUT:-2}
+      HTTP_PORT:       8000
+      TEMP_THRESHOLD:  ${TEMP_THRESHOLD:-30.0}
+      SMTP_HOST:       mailhog
+      SMTP_PORT:       1025
+      ALERT_FROM:      ${ALERT_FROM:-iot-gateway@example.com}
+      ALERT_TO:        ${ALERT_TO:-ops@example.com}
+      COOLDOWN_SECS:   ${COOLDOWN_SECS:-300}
     restart: unless-stopped

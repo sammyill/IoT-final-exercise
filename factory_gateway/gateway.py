@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 import urllib.error
 
+import aiohttp
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
@@ -41,6 +42,12 @@ INFLUX_ORG    = os.getenv("INFLUX_ORG",    "its")
 INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "iot")
 COAP_PORT     = int(os.getenv("COAP_PORT", "5683"))
 
+# URL del gateway HTTP che valuta soglie e invia email a Mailhog.
+# Endpoint "factory" perché tutti i dati di questo gateway sono CoAP/factory.
+AMQP_GATEWAY_URL = os.getenv("AMQP_GATEWAY_URL", "http://amqp-gateway:8000/factory")
+# Sessione aiohttp globale, creata in main(). None se il forwarding è disabilitato.
+http_session: "aiohttp.ClientSession | None" = None
+
 # Buffer interno: se InfluxDB non risponde, i dati restano qui
 INTERNAL_BUFFER_MAX = 2000
 internal_buffer = deque(maxlen=INTERNAL_BUFFER_MAX)
@@ -50,10 +57,12 @@ executor = ThreadPoolExecutor(max_workers=1)
 
 # Statistiche operative
 stats = {
-    "received": 0,   # messaggi CoAP ricevuti dai sensori
-    "written":  0,   # punti scritti su InfluxDB con successo
-    "buffered": 0,   # punti in attesa nel buffer interno
-    "errors":   0,   # errori di scrittura InfluxDB
+    "received":   0,   # messaggi CoAP ricevuti dai sensori
+    "written":    0,   # punti scritti su InfluxDB con successo
+    "buffered":   0,   # punti in attesa nel buffer interno
+    "errors":     0,   # errori di scrittura InfluxDB
+    "amqp_sent":  0,   # forward HTTP a amqp-gateway riusciti
+    "amqp_fail":  0,   # forward HTTP a amqp-gateway falliti
 }
 
 # Client InfluxDB (inizializzato in main dopo il health check)
@@ -143,6 +152,26 @@ async def influx_writer_loop():
 
 
 # ──────────────────────────────────────────────────────────────
+# Forward HTTP a amqp-gateway (alert/email)
+# ──────────────────────────────────────────────────────────────
+# Fire-and-forget: spediamo il dato a amqp-gateway senza
+# bloccare la risposta CoAP al sensore. Se il forward fallisce,
+# il dato è comunque già accodato per InfluxDB.
+async def forward_to_amqp(data: dict) -> None:
+    if http_session is None:
+        return
+    try:
+        async with http_session.post(AMQP_GATEWAY_URL, json=data) as resp:
+            if resp.status < 400:
+                stats["amqp_sent"] += 1
+            else:
+                stats["amqp_fail"] += 1
+    except Exception:
+        # Best-effort: l'alerting non deve bloccare la pipeline dati.
+        stats["amqp_fail"] += 1
+
+
+# ──────────────────────────────────────────────────────────────
 # Risorsa CoAP: /iot/temperatura
 # ──────────────────────────────────────────────────────────────
 class TemperaturaResource(resource.Resource):
@@ -173,6 +202,10 @@ class TemperaturaResource(resource.Resource):
 
             internal_buffer.append(data)
             stats["buffered"] = len(internal_buffer)
+
+            # Forward HTTP a amqp-gateway in background (fire-and-forget).
+            # Non blocca la risposta ACK al sensore.
+            asyncio.create_task(forward_to_amqp(data))
 
             # Log ogni 20 messaggi per non spammare
             if stats["received"] % 20 == 1:
@@ -221,17 +254,23 @@ async def wait_for_influxdb():
 # Main
 # ──────────────────────────────────────────────────────────────
 async def main():
-    global influx_client, write_api
+    global influx_client, write_api, http_session
 
     print("=" * 55)
     print(f"[BOOT] CoAP Gateway avviato")
-    print(f"[BOOT]   INFLUX_URL    = {INFLUX_URL}")
-    print(f"[BOOT]   INFLUX_ORG    = {INFLUX_ORG}")
-    print(f"[BOOT]   INFLUX_BUCKET = {INFLUX_BUCKET}")
-    print(f"[BOOT]   COAP_PORT     = {COAP_PORT}/udp")
-    print(f"[BOOT]   BUFFER_MAX    = {INTERNAL_BUFFER_MAX} punti")
-    print(f"[BOOT]   Risorsa CoAP  = /iot/temperatura")
+    print(f"[BOOT]   INFLUX_URL       = {INFLUX_URL}")
+    print(f"[BOOT]   INFLUX_ORG       = {INFLUX_ORG}")
+    print(f"[BOOT]   INFLUX_BUCKET    = {INFLUX_BUCKET}")
+    print(f"[BOOT]   COAP_PORT        = {COAP_PORT}/udp")
+    print(f"[BOOT]   BUFFER_MAX       = {INTERNAL_BUFFER_MAX} punti")
+    print(f"[BOOT]   AMQP_GATEWAY_URL = {AMQP_GATEWAY_URL}")
+    print(f"[BOOT]   Risorsa CoAP     = /iot/temperatura")
     print("=" * 55)
+
+    # Sessione HTTP riusabile per il forwarding (un connector pool unico).
+    http_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=5),
+    )
 
     # 1. Aspetta InfluxDB
     await wait_for_influxdb()
