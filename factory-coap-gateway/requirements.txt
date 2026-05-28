@@ -1,0 +1,2 @@
+aiocoap>=0.4.7
+influxdb-client>=1.36.0

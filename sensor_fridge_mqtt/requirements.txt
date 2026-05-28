@@ -1,0 +1,3 @@
+# Libreria client MQTT per Python — versione 2.x con API migliorata
+# Documentazione: https://eclipse.dev/paho/index.php?page=clients/python/index.php
+paho-mqtt>=2.0.0

@@ -1,0 +1,291 @@
+version: "3.9"
+
+# ============================================================
+# CoAP IoT Stack - Progetto didattico ITS 3° anno
+# Protocollo: CoAP su UDP (porta 5683)
+# Architettura: sensor → coap-gateway → InfluxDB ← Node-RED
+# ============================================================
+
+networks:
+  wan_simulated_net:
+    driver: bridge
+  factory_net:
+    driver: bridge
+  fridge_net:
+    driver: bridge
+
+volumes:
+  influxdb_data:
+
+services:
+
+  # ── Factory Sensors ────────────────────────────────────
+  # ── Using CoAP ────────────────────────────────────
+  sensor-factory-01:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory01
+
+  sensor-factory-02:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory02
+
+  sensor-factory-03:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory03
+
+  sensor-factory-04:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory04
+
+  sensor-factory-05:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory05
+
+  sensor-factory-06:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory06
+
+  sensor-factory-07:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory07
+
+  sensor-factory-08:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory-08
+
+  sensor-factory-09:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory09
+
+  sensor-factory-10:
+    <<: *sensor-defaults
+    environment:
+      SENSOR_ID: factory10
+  
+  # ── Fridge Sensors ────────────────────────────────────
+  # ── Using MQTT ────────────────────────────────────
+  sensor01:
+    <<: *sensor-base
+    container_name: sensor-01
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor01
+
+  sensor02:
+    <<: *sensor-base
+    container_name: sensor-02
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor02
+
+  sensor03:
+    <<: *sensor-base
+    container_name: sensor-03
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor03
+
+  sensor04:
+    <<: *sensor-base
+    container_name: sensor-04
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor04
+
+  sensor05:
+    <<: *sensor-base
+    container_name: sensor-05
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor05
+
+  sensor06:
+    <<: *sensor-base
+    container_name: sensor-06
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor06
+
+  sensor07:
+    <<: *sensor-base
+    container_name: sensor-07
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor07
+
+  sensor08:
+    <<: *sensor-base
+    container_name: sensor-08
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor08
+
+  sensor09:
+    <<: *sensor-base
+    container_name: sensor-09
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor09
+
+  sensor10:
+    <<: *sensor-base
+    container_name: sensor-10
+    environment:
+      <<: *sensor-env
+      SENSOR_ID: sensor10
+
+  # ── CoAP Gateway ────────────────────────────────────────────
+  coap-gateway:
+    build: ./coap-gateway
+    container_name: coap-gateway
+    networks:
+      - factory_net
+      - wan_simulated_net
+    ports:
+      - "5683:5683/udp"   # CoAP usa UDP, non TCP!
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      INFLUX_ORG: ${INFLUX_ORG}
+      INFLUX_BUCKET: ${INFLUX_BUCKET}
+      COAP_PORT: 5683
+  
+  # ── Mosquitto mqtt broker ────────────────────────────────────────────
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: mosquitto
+    ports:
+      - "1883:1883"         # MQTT standard
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/data:/mosquitto/data   # persistenza messaggi su disco
+      - ./mosquitto/log:/mosquitto/log
+    networks:
+      - sensor_net          # lato sensori
+      - core_net            # lato servizi
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "health", "-m", "ok", "-q", "0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Telegraf ────────────────────────────────────────────
+  gateway:
+    image: telegraf:latest
+    container_name: mqtt-gateway
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    networks:
+      - core_net            # SOLO core_net: se si disconnette, perde accesso a tutto
+    restart: unless-stopped
+
+  # ── Node-RED (dashboard + alerting) ────────────────────────
+  nodered:
+    build: ./nodered
+    container_name: node-red-coap
+    networks:
+      - wan_simulated_net
+    ports:
+      - "1880:1880"
+    volumes:
+      - ./nodered/data:/data  # flussi e configurazioni persistenti
+    restart: unless-stopped
+
+  # ── InfluxDB v2 (time-series database) ─────────────────────
+  influxdb:
+    image: influxdb:2
+    container_name: influxdb
+    networks:
+      - wan_simulated_net
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USER}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN}
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── Mailhog (fake SMTP per test email) ─────────────────────
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    container_name: mailhog-coap
+    networks:
+      - wan_simulated_net
+    ports:
+      - "4025:1025"   # SMTP
+      - "5025:8025"   # Web UI → http://localhost:5025
+    restart: unless-stopped
+
+  # ── Chaos (simulatore di guasti di rete) ───────────────────
+  chaos:
+    build: ./chaos
+    container_name: network-chaos-coap
+    networks:
+      - factory_net
+      - wan_simulated_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      FACTORY_NET: factory_net
+      CORE_NET: wan_simulated_net
+      DROP_INTERVAL: ${CHAOS_DROP_INTERVAL:-90}
+      DROP_DURATION: ${CHAOS_DROP_DURATION:-20}
+      CHAOS_ENABLED: ${CHAOS_ENABLED:-true}
+    restart: unless-stopped
+
+  # ── Gateway AMQP → InfluxDB ──────────────────────────────────────────────────
+  amqp-gateway:
+    build: ./amqp-gateway
+    container_name: amqp-gateway
+    networks:
+      - amqp_core_net
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-iot}
+      RABBITMQ_PASS: ${RABBITMQ_PASS:-iot-password}
+      QUEUE_NAME: ${QUEUE_NAME:-iot.temperature}
+      EXCHANGE_NAME: ${EXCHANGE_NAME:-iot.sensors}
+      INFLUX_URL: http://influxdb_amqp:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN:-my-super-token}
+      INFLUX_ORG: ${INFLUX_ORG:-its}
+      INFLUX_BUCKET: ${INFLUX_BUCKET:-iot}
+      PREFETCH_COUNT: ${PREFETCH_COUNT:-50}
+      BATCH_SIZE: ${BATCH_SIZE:-20}
+      BATCH_TIMEOUT: ${BATCH_TIMEOUT:-2}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      influxdb_amqp:
+        condition: service_healthy
+    restart: unless-stopped
