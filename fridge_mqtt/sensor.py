@@ -36,10 +36,10 @@ import paho.mqtt.client as mqtt
 # così ogni container sensore ha valori diversi senza modificare
 # il codice sorgente.
 # ============================================================
-BROKER      = "mosquitto"
-PORT        = "1883"
-INTERVAL    = "30"
-SENSOR_ID   = os.getenv("SENSOR_ID","sensore01")
+BROKER = "mosquitto"
+PORT = 1883
+INTERVAL = 30
+SENSOR_ID = os.getenv("SENSOR_ID","sensore01")
 
 # QoS=1: "at least once" — il broker salva il messaggio finché
 # non riceve ACK dal subscriber. Nessun messaggio viene perso.

@@ -26,9 +26,9 @@ from collections import deque
 # ──────────────────────────────────────────────────────────────
 # Configurazione da variabili d'ambiente
 # ──────────────────────────────────────────────────────────────
-COAP_SERVER   ="coap-gateway"
-COAP_PORT     = "5683"
-SEND_INTERVAL = "30"
+COAP_SERVER ="factory-gateway"
+COAP_PORT  = 5683
+SEND_INTERVAL = 30
 SENSOR_ID     = os.getenv("SENSOR_ID", "sensor-01")
 
 COAP_URI      = f"coap://{COAP_SERVER}:{COAP_PORT}/iot/temperatura"

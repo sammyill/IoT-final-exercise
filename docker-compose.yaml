@@ -1,10 +1,17 @@
 version: "3.9"
 
-# ============================================================
-# CoAP IoT Stack - Progetto didattico ITS 3° anno
-# Protocollo: CoAP su UDP (porta 5683)
-# Architettura: sensor → coap-gateway → InfluxDB ← Node-RED
-# ============================================================
+# ─── Template sensore ──────────────────────────────────────────────────────────
+x-sensor-factory: &sensor-factory
+  build: ./factory_coap
+  networks:
+    - factory_net
+  restart: unless-stopped
+
+x-sensor-fridge: &sensor-fridge
+  build: ./fridge_mqtt
+  networks:
+    - fridge_net
+  restart: unless-stopped
 
 networks:
   wan_simulated_net:
@@ -19,134 +26,136 @@ volumes:
 
 services:
 
+
+
   # ── Factory Sensors ────────────────────────────────────
   # ── Using CoAP ────────────────────────────────────
   sensor-factory-01:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory01
     environment:
       SENSOR_ID: factory01
 
   sensor-factory-02:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory02
     environment:
       SENSOR_ID: factory02
 
   sensor-factory-03:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory03
     environment:
       SENSOR_ID: factory03
 
   sensor-factory-04:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory04
     environment:
       SENSOR_ID: factory04
 
   sensor-factory-05:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory05
     environment:
       SENSOR_ID: factory05
 
   sensor-factory-06:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory06
     environment:
       SENSOR_ID: factory06
 
   sensor-factory-07:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory07
     environment:
       SENSOR_ID: factory07
 
   sensor-factory-08:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory08
     environment:
       SENSOR_ID: factory-08
 
   sensor-factory-09:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory09
     environment:
       SENSOR_ID: factory09
 
   sensor-factory-10:
-    <<: *sensor-defaults
+    <<: *sensor-factory
+    container_name: factory10
     environment:
       SENSOR_ID: factory10
   
   # ── Fridge Sensors ────────────────────────────────────
   # ── Using MQTT ────────────────────────────────────
   sensor01:
-    <<: *sensor-base
-    container_name: sensor-01
+    <<: *sensor-fridge
+    container_name: sensor01
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor01
 
   sensor02:
-    <<: *sensor-base
-    container_name: sensor-02
+    <<: *sensor-fridge
+    container_name: sensor02
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor02
 
   sensor03:
-    <<: *sensor-base
-    container_name: sensor-03
+    <<: *sensor-fridge
+    container_name: sensor03
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor03
 
   sensor04:
-    <<: *sensor-base
-    container_name: sensor-04
+    <<: *sensor-fridge
+    container_name: sensor04
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor04
 
   sensor05:
-    <<: *sensor-base
-    container_name: sensor-05
+    <<: *sensor-fridge
+    container_name: sensor05
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor05
 
   sensor06:
-    <<: *sensor-base
-    container_name: sensor-06
+    <<: *sensor-fridge
+    container_name: sensor06
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor06
 
   sensor07:
-    <<: *sensor-base
-    container_name: sensor-07
+    <<: *sensor-fridge
+    container_name: sensor07
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor07
 
   sensor08:
-    <<: *sensor-base
-    container_name: sensor-08
+    <<: *sensor-fridge
+    container_name: sensor08
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor08
 
   sensor09:
-    <<: *sensor-base
-    container_name: sensor-09
+    <<: *sensor-fridge
+    container_name: sensor09
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor09
 
   sensor10:
-    <<: *sensor-base
-    container_name: sensor-10
+    <<: *sensor-fridge
+    container_name: sensor10
     environment:
-      <<: *sensor-env
       SENSOR_ID: sensor10
 
   # ── CoAP Gateway ────────────────────────────────────────────
-  coap-gateway:
-    build: ./coap-gateway
-    container_name: coap-gateway
+  factory-gateway:
+    build: ./factory_gateway
+    container_name: factory-gateway
     networks:
       - factory_net
       - wan_simulated_net
@@ -174,8 +183,8 @@ services:
       - ./mosquitto/data:/mosquitto/data   # persistenza messaggi su disco
       - ./mosquitto/log:/mosquitto/log
     networks:
-      - sensor_net          # lato sensori
-      - core_net            # lato servizi
+      - fridge_net          # lato sensori
+      - wan_simulated_net            # lato servizi
     healthcheck:
       test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "health", "-m", "ok", "-q", "0"]
       interval: 10s
@@ -195,7 +204,7 @@ services:
     volumes:
       - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
     networks:
-      - core_net            # SOLO core_net: se si disconnette, perde accesso a tutto
+      - wan_simulated_net            # SOLO core_net: se si disconnette, perde accesso a tutto
     restart: unless-stopped
 
   # ── Node-RED (dashboard + alerting) ────────────────────────
@@ -268,15 +277,12 @@ services:
     build: ./amqp-gateway
     container_name: amqp-gateway
     networks:
-      - amqp_core_net
+      - wan_simulated_net
     environment:
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_USER: ${RABBITMQ_USER:-iot}
-      RABBITMQ_PASS: ${RABBITMQ_PASS:-iot-password}
+     
       QUEUE_NAME: ${QUEUE_NAME:-iot.temperature}
       EXCHANGE_NAME: ${EXCHANGE_NAME:-iot.sensors}
-      INFLUX_URL: http://influxdb_amqp:8086
+      INFLUX_URL: http://influxdb:8086
       INFLUX_TOKEN: ${INFLUX_TOKEN:-my-super-token}
       INFLUX_ORG: ${INFLUX_ORG:-its}
       INFLUX_BUCKET: ${INFLUX_BUCKET:-iot}
@@ -284,8 +290,7 @@ services:
       BATCH_SIZE: ${BATCH_SIZE:-20}
       BATCH_TIMEOUT: ${BATCH_TIMEOUT:-2}
     depends_on:
-      rabbitmq:
-        condition: service_healthy
+      
       influxdb_amqp:
         condition: service_healthy
     restart: unless-stopped
